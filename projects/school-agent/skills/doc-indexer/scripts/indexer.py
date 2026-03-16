@@ -34,6 +34,9 @@ CHUNK_SIZE   = int(os.getenv("CHUNK_SIZE", "500"))
 CHUNK_OVERLAP= int(os.getenv("CHUNK_OVERLAP", "50"))
 COLLECTION   = "school_docs"
 
+# 인덱싱 제외 패턴 (파일명/경로에 포함되면 무시)
+EXCLUDE_PATTERNS = [p.strip() for p in os.getenv("EXCLUDE_PATTERNS", "").split(",") if p.strip()]
+
 # 간단한 부서(업무) 키워드 사전 (파일명/경로에서 추출)
 DEPT_KEYWORDS = [
     "교무", "연구", "과학", "체육", "보건", "급식", "행정", "학생", "생활", "안전",
@@ -46,6 +49,16 @@ embed_fn = SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
 client   = chromadb.PersistentClient(path=CHROMA_PATH)
 col      = client.get_or_create_collection(COLLECTION, embedding_function=embed_fn)
 print(f"[init] ChromaDB 준비 완료 (컬렉션: {COLLECTION})")
+
+
+# ── 유틸리티 ────────────────────────────────────────────────────────
+def should_exclude(path: Path) -> bool:
+    """파일명이나 경로에 제외 패턴이 포함되어 있는지 확인합니다."""
+    path_str = str(path.resolve())
+    for pattern in EXCLUDE_PATTERNS:
+        if pattern in path_str:
+            return True
+    return False
 
 
 # ── 메타데이터 추출 ───────────────────────────────────────────────────
@@ -211,6 +224,10 @@ def index_file(path: Path) -> bool:
     suffix = path.suffix.lower()
     if suffix not in (".odt", ".pdf"):
         return False
+    
+    if should_exclude(path):
+        print(f"  [제외] 패턴 매칭되어 인덱싱 건너뜀: {path.name}")
+        return False
 
     fhash = file_hash(path)
 
@@ -265,6 +282,51 @@ def index_folder(folder: Path):
     print(f"\n[완료] 전체 저장된 청크 수: {total}")
 
 
+def purge_excluded_data():
+    """DB에 이미 저장된 데이터 중 제외 패턴에 맞는 것들을 삭제합니다."""
+    if not EXCLUDE_PATTERNS:
+        print("[!] 설정된 제외 패턴(EXCLUDE_PATTERNS)이 없습니다.")
+        return
+
+    print(f"[purge] 현재 제외 패턴: {EXCLUDE_PATTERNS}")
+    
+    # DB의 모든 메타데이터를 확인하여 패턴 매칭되는 파일명/경로 찾기
+    all_data = col.get(include=["metadatas"])
+    metas = all_data.get("metadatas") or []
+    ids = all_data.get("ids") or []
+    
+    deleted_ids = []
+    deleted_files = set()
+    
+    for i, meta in zip(ids, metas):
+        file_name = meta.get("file_name", "")
+        file_path = meta.get("file_path", "")
+        
+        # 파일명이나 경로에 패턴이 있는지 확인
+        is_match = False
+        for p in EXCLUDE_PATTERNS:
+            if p in file_name or p in file_path:
+                is_match = True
+                break
+        
+        if is_match:
+            deleted_ids.append(i)
+            deleted_files.add(file_name)
+    
+    if deleted_ids:
+        # ChromaDB는 한 번에 너무 많은 ID를 삭제하면 에러가 날 수 있으므로 배치 처리
+        batch_size = 500
+        for i in range(0, len(deleted_ids), batch_size):
+            batch = deleted_ids[i : i + batch_size]
+            col.delete(ids=batch)
+            
+        print(f"  🔥 삭제 완료: {len(deleted_files)}개 파일 ({len(deleted_ids)}개 청크)")
+        for f in sorted(list(deleted_files)):
+            print(f"    - {f}")
+    else:
+        print("  ✅ 삭제할 데이터가 없습니다.")
+
+
 # ── 실시간 감시 ──────────────────────────────────────────────────────
 class DocHandler(FileSystemEventHandler):
     def on_created(self, event):
@@ -289,7 +351,13 @@ class DocHandler(FileSystemEventHandler):
 def main():
     parser = argparse.ArgumentParser(description="공문서 인덱서")
     parser.add_argument("--once", action="store_true", help="기존 파일만 1회 인덱싱 후 종료")
+    parser.add_argument("--purge-excluded", action="store_true", help="제외 패턴에 맞는 기존 데이터를 DB에서 삭제")
     args = parser.parse_args()
+
+    if args.purge_excluded:
+        purge_excluded_data()
+        if not args.once: # --once가 없으면 삭제만 하고 종료
+            return
 
     WATCH_FOLDER.mkdir(parents=True, exist_ok=True)
     print(f"[설정] 감시 폴더: {WATCH_FOLDER.resolve()}")

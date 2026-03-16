@@ -10,6 +10,7 @@ import sys
 import time
 import hashlib
 import argparse
+import re
 from pathlib import Path
 from datetime import datetime
 
@@ -33,6 +34,12 @@ CHUNK_SIZE   = int(os.getenv("CHUNK_SIZE", "500"))
 CHUNK_OVERLAP= int(os.getenv("CHUNK_OVERLAP", "50"))
 COLLECTION   = "school_docs"
 
+# 간단한 부서(업무) 키워드 사전 (파일명/경로에서 추출)
+DEPT_KEYWORDS = [
+    "교무", "연구", "과학", "체육", "보건", "급식", "행정", "학생", "생활", "안전",
+    "돌봄", "방과후", "특수", "상담", "인사", "회계", "예산", "시설", "정보", "전산",
+]
+
 # ── ChromaDB 초기화 ─────────────────────────────────────────────────
 print(f"[init] 임베딩 모델 로딩: {EMBED_MODEL}")
 embed_fn = SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
@@ -41,46 +48,61 @@ col      = client.get_or_create_collection(COLLECTION, embedding_function=embed_
 print(f"[init] ChromaDB 준비 완료 (컬렉션: {COLLECTION})")
 
 
-# ── ODT 파싱 ────────────────────────────────────────────────────────
-def parse_odt(path: Path) -> str:
-    """ODT 파일에서 텍스트(단락 + 표)를 추출합니다."""
+# ── 메타데이터 추출 ───────────────────────────────────────────────────
+def extract_year_from_path(path: Path) -> str | None:
+    # 폴더명/파일명 어디든 20xx가 있으면 연도로 사용
+    m = re.search(r"(20\d{2})", str(path))
+    return m.group(1) if m else None
+
+
+def extract_dept_from_path(path: Path) -> str | None:
+    s = str(path)
+    for kw in DEPT_KEYWORDS:
+        if kw in s:
+            return kw
+    return None
+
+
+# ── ODT 파싱 (구조 보존) ──────────────────────────────────────────────
+def parse_odt_elements(path: Path) -> list[dict]:
+    """ODT 파일에서 문단/표를 요소 단위로 추출합니다."""
     try:
-        doc   = load_odt(str(path))
-        parts = []
+        doc = load_odt(str(path))
+        elements: list[dict] = []
 
-        # 단락 텍스트
-        for elem in doc.text.childNodes:
-            text = teletype.extractText(elem).strip()
-            if text:
-                parts.append(text)
+        def walk(node):
+            # 문단
+            if getattr(node, "qname", None) and node.qname[1] == "p":
+                text = teletype.extractText(node).strip()
+                if text:
+                    elements.append({"type": "paragraph", "text": text})
+                return
 
-        # 표 데이터
-        for table in doc.spreadsheet.childNodes if hasattr(doc, 'spreadsheet') else []:
-            pass  # ODT 표는 doc.text 안에 있음
+            # 표
+            if getattr(node, "qname", None) and node.qname[1] == "table":
+                rows_out: list[str] = []
+                for row in getattr(node, "childNodes", []):
+                    if getattr(row, "qname", None) and row.qname[1] == "table-row":
+                        cells: list[str] = []
+                        for cell in getattr(row, "childNodes", []):
+                            if getattr(cell, "qname", None) and cell.qname[1] == "table-cell":
+                                val = teletype.extractText(cell).strip()
+                                cells.append(val)
+                        if any(c.strip() for c in cells):
+                            rows_out.append(" | ".join(c.strip() for c in cells))
+                if rows_out:
+                    elements.append({"type": "table", "text": "\n".join(rows_out)})
+                return
 
-        # 표를 명시적으로 탐색
-        def extract_tables(node):
-            if node.qname and node.qname[1] == 'table':
-                rows = []
-                for row in node.childNodes:
-                    if hasattr(row, 'qname') and row.qname[1] == 'table-row':
-                        cells = []
-                        for cell in row.childNodes:
-                            if hasattr(cell, 'qname') and cell.qname[1] == 'table-cell':
-                                cells.append(teletype.extractText(cell).strip())
-                        if any(cells):
-                            rows.append(" | ".join(cells))
-                if rows:
-                    parts.append("\n".join(rows))
-            for child in getattr(node, 'childNodes', []):
-                extract_tables(child)
+            for child in getattr(node, "childNodes", []):
+                walk(child)
 
-        extract_tables(doc.text)
-        return "\n".join(parts)
+        walk(doc.text)
+        return elements
 
     except Exception as e:
         print(f"  [경고] ODT 파싱 실패: {path.name} — {e}")
-        return ""
+        return []
 
 
 def parse_pdf(path: Path) -> str:
@@ -96,16 +118,86 @@ def parse_pdf(path: Path) -> str:
         return ""
 
 
-# ── 텍스트 청킹 ─────────────────────────────────────────────────────
-def chunk_text(text: str) -> list[str]:
-    """텍스트를 CHUNK_SIZE 단위로 나누고 CHUNK_OVERLAP만큼 겹칩니다."""
-    chunks = []
-    start  = 0
-    while start < len(text):
-        end = start + CHUNK_SIZE
-        chunks.append(text[start:end])
-        start += CHUNK_SIZE - CHUNK_OVERLAP
-    return [c.strip() for c in chunks if c.strip()]
+# ── 구조 보존 청킹 ────────────────────────────────────────────────────
+def _chunk_by_elements(elements: list[dict]) -> list[tuple[str, dict]]:
+    """
+    요소(문단/표)를 경계로 유지하면서 CHUNK_SIZE 목표로 묶습니다.
+    반환: (chunk_text, chunk_meta) 리스트
+    """
+    chunks: list[tuple[str, dict]] = []
+    buf: list[dict] = []
+    buf_len = 0
+
+    def flush():
+        nonlocal buf, buf_len
+        if not buf:
+            return
+        text = "\n\n".join(e["text"] for e in buf if e.get("text"))
+        if text.strip():
+            chunk_type = "mixed"
+            types = {e.get("type") for e in buf}
+            if len(types) == 1:
+                chunk_type = next(iter(types))
+            chunks.append((text.strip(), {"chunk_type": chunk_type}))
+        buf = []
+        buf_len = 0
+
+    for e in elements:
+        t = (e.get("text") or "").strip()
+        if not t:
+            continue
+
+        # 요소가 너무 길면(특히 표) 단독 청크로 처리하되, 정말 큰 경우에만 슬라이스
+        if len(t) >= CHUNK_SIZE:
+            flush()
+            if len(t) <= CHUNK_SIZE * 2:
+                chunks.append((t, {"chunk_type": e.get("type", "unknown")}))
+            else:
+                start = 0
+                while start < len(t):
+                    end = start + CHUNK_SIZE
+                    part = t[start:end].strip()
+                    if part:
+                        chunks.append((part, {"chunk_type": e.get("type", "unknown")}))
+                    start += CHUNK_SIZE - CHUNK_OVERLAP
+            continue
+
+        # 버퍼에 추가했을 때 넘치면 먼저 flush
+        if buf and (buf_len + len(t) + 2) > CHUNK_SIZE:
+            flush()
+
+        buf.append(e)
+        buf_len += len(t) + 2
+
+    flush()
+
+    # 오버랩: 이전 청크의 마지막 N자를 다음 청크 앞에 붙여 맥락 유지(구조 경계는 유지)
+    if CHUNK_OVERLAP > 0 and len(chunks) >= 2:
+        out: list[tuple[str, dict]] = [chunks[0]]
+        for prev, cur in zip(chunks, chunks[1:]):
+            prev_text, _ = prev
+            cur_text, cur_meta = cur
+            overlap = prev_text[-CHUNK_OVERLAP:].strip()
+            if overlap and not cur_text.startswith(overlap):
+                cur_text = overlap + "\n" + cur_text
+            out.append((cur_text, cur_meta))
+        return out
+
+    return chunks
+
+
+def chunk_for_file(path: Path, suffix: str) -> list[tuple[str, dict]]:
+    """파일 형식별로 구조를 최대한 보존하여 청킹합니다."""
+    if suffix == ".odt":
+        elements = parse_odt_elements(path)
+        return _chunk_by_elements(elements)
+    # PDF: 구조 정보가 약해 문단 단위로 최대한 분리
+    text = parse_pdf(path)
+    if not text.strip():
+        return []
+    paras = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+    elements = [{"type": "paragraph", "text": p} for p in paras]
+    return _chunk_by_elements(elements)
 
 
 # ── 파일 ID 생성 ─────────────────────────────────────────────────────
@@ -129,17 +221,15 @@ def index_file(path: Path) -> bool:
         return False
 
     print(f"  [파싱] {path.name} ...")
-    if suffix == ".odt":
-        text = parse_odt(path)
-    else:
-        text = parse_pdf(path)
-
-    if not text.strip():
+    chunk_pairs = chunk_for_file(path, suffix)
+    if not chunk_pairs:
         print(f"  [경고] 텍스트 비어있음: {path.name}")
         return False
 
-    chunks = chunk_text(text)
+    chunks = [t for (t, _m) in chunk_pairs]
     now    = datetime.now().isoformat()
+    year   = extract_year_from_path(path)
+    dept   = extract_dept_from_path(path)
 
     ids       = [f"{fhash}_{i}" for i in range(len(chunks))]
     metadatas = [
@@ -149,6 +239,9 @@ def index_file(path: Path) -> bool:
             "file_hash": fhash,
             "file_type": suffix,
             "chunk_idx": i,
+            "chunk_type": chunk_pairs[i][1].get("chunk_type", "unknown"),
+            "year": year,
+            "dept": dept,
             "indexed_at": now,
         }
         for i in range(len(chunks))

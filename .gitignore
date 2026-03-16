@@ -6,6 +6,9 @@
 .env.local
 .env.*
 
+# ChromaDB 인덱싱 DB (개인 문서 벡터 포함 → git 제외, OneDrive에서 공유)
+**/chroma-db/
+
 # 시스템 파일
 .DS_Store
 Thumbs.db
